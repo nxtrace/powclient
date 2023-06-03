@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"log"
 	"math/big"
 	"net/http"
 	"time"
@@ -93,7 +93,11 @@ func requestChallenge(getTokenParams *GetTokenParams) (*RequestResponse, error) 
 	//req.Header.Add("Host", getTokenParams.Host)
 	req.Host = getTokenParams.Host
 	resp, err := client.Do(req)
-	if err != nil {
+	if err != nil || resp.StatusCode != http.StatusOK {
+		// 如果http_code为429
+		if resp.StatusCode == http.StatusTooManyRequests {
+			log.Fatalln("请求次数超限，请稍后再试")
+		}
 		return nil, err
 	}
 	defer func(Body io.ReadCloser) {
@@ -169,7 +173,7 @@ func submitAnswer(getTokenParams *GetTokenParams, challengeResponse *RequestResp
 	}(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := ioutil.ReadAll(resp.Body)
+		bodyBytes, _ := io.ReadAll(resp.Body)
 		return "", errors.New(string(bodyBytes))
 	}
 
