@@ -42,7 +42,7 @@ type GetTokenParams struct {
 	UserAgent   string
 	SNI         string
 	Host        string
-	Proxy       string /** 支持socks5:// http:// **/
+	Proxy       *url.URL /** 支持socks5:// http:// **/
 }
 
 func NewGetTokenParams() *GetTokenParams {
@@ -54,7 +54,7 @@ func NewGetTokenParams() *GetTokenParams {
 		UserAgent:   "POW client",
 		SNI:         "",
 		Host:        "",
-		Proxy:       "",
+		Proxy:       nil,
 	}
 }
 
@@ -80,9 +80,8 @@ func RetToken(getTokenParams *GetTokenParams) (string, error) {
 			},
 		}
 	}
-	if getTokenParams.Proxy != "" {
-		proxyURL, _ := url.Parse(getTokenParams.Proxy)
-		client.Transport.(*http.Transport).Proxy = http.ProxyURL(proxyURL)
+	if getTokenParams.Proxy != nil {
+		client.Transport.(*http.Transport).Proxy = http.ProxyURL(getTokenParams.Proxy)
 	}
 	challengeParams := &ChallengeParams{
 		BaseUrl:     getTokenParams.BaseUrl,
