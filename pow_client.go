@@ -81,6 +81,9 @@ func RetToken(getTokenParams *GetTokenParams) (string, error) {
 		}
 	}
 	if getTokenParams.Proxy != nil {
+		if client.Transport == nil {
+			client.Transport = &http.Transport{}
+		}
 		client.Transport.(*http.Transport).Proxy = http.ProxyURL(getTokenParams.Proxy)
 	}
 	challengeParams := &ChallengeParams{
@@ -116,11 +119,7 @@ func requestChallenge(challengeParams *ChallengeParams) (*RequestResponse, error
 	//req.Header.Add("Host", getTokenParams.Host)
 	req.Host = challengeParams.Host
 	resp, err := challengeParams.Client.Do(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		// 如果http_code为429
-		if resp.StatusCode == http.StatusTooManyRequests {
-			log.Fatalln("请求次数超限，请稍后再试")
-		}
+	if err != nil {
 		return nil, err
 	}
 	defer func(Body io.ReadCloser) {
@@ -129,6 +128,14 @@ func requestChallenge(challengeParams *ChallengeParams) (*RequestResponse, error
 			fmt.Println(err)
 		}
 	}(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusTooManyRequests {
+			log.Fatalln("请求次数超限，请稍后再试")
+		}
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
 	var challengeResponse RequestResponse
 	err = json.NewDecoder(resp.Body).Decode(&challengeResponse)
 	if err != nil {
@@ -184,6 +191,9 @@ func submitAnswer(challengeParams *ChallengeParams, challengeResponse *RequestRe
 	}(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return "", errors.New("请求次数超限")
+		}
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		return "", errors.New(string(bodyBytes))
 	}
