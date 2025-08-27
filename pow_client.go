@@ -140,7 +140,7 @@ func RetToken(getTokenParams *GetTokenParams) (string, error) {
 	return token, nil
 }
 
-func requestChallenge(challengeParams *ChallengeParams) (*RequestResponse, error) {
+func requestChallenge(challengeParams *ChallengeParams) (rr *RequestResponse, err error) {
 	req, err := http.NewRequest("GET", challengeParams.BaseUrl+challengeParams.RequestPath, nil)
 	if err != nil {
 		return nil, err
@@ -154,7 +154,11 @@ func requestChallenge(challengeParams *ChallengeParams) (*RequestResponse, error
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if cerr := resp.Body.Close(); err == nil && cerr != nil {
+			err = fmt.Errorf("close response body: %w", cerr)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		if resp.StatusCode == http.StatusTooManyRequests {
@@ -165,15 +169,14 @@ func requestChallenge(challengeParams *ChallengeParams) (*RequestResponse, error
 	}
 
 	var challengeResponse RequestResponse
-	err = json.NewDecoder(resp.Body).Decode(&challengeResponse)
-	if err != nil {
+	if err = json.NewDecoder(resp.Body).Decode(&challengeResponse); err != nil {
 		return nil, err
 	}
-
-	return &challengeResponse, nil
+	rr = &challengeResponse
+	return
 }
 
-func submitAnswer(challengeParams *ChallengeParams, challengeResponse *RequestResponse) (string, error) {
+func submitAnswer(challengeParams *ChallengeParams, challengeResponse *RequestResponse) (token string, err error) {
 	requestTime := challengeResponse.RequestTime
 	challenge := challengeResponse.Challenge.Challenge
 	requestId := challengeResponse.Challenge.RequestID
@@ -215,7 +218,11 @@ func submitAnswer(challengeParams *ChallengeParams, challengeResponse *RequestRe
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if cerr := resp.Body.Close(); err == nil && cerr != nil {
+			err = fmt.Errorf("close response body: %w", cerr)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		if resp.StatusCode == http.StatusTooManyRequests {
@@ -226,14 +233,12 @@ func submitAnswer(challengeParams *ChallengeParams, challengeResponse *RequestRe
 	}
 
 	var submitResponse SubmitResponse
-	err = json.NewDecoder(resp.Body).Decode(&submitResponse)
-	if err != nil {
+	if err = json.NewDecoder(resp.Body).Decode(&submitResponse); err != nil {
 		return "", err
 	}
-
 	if submitResponse.Token == "" {
 		return "", ErrEmptyToken
 	}
-
-	return submitResponse.Token, nil
+	token = submitResponse.Token
+	return
 }
