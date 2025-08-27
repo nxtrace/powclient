@@ -7,12 +7,40 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"math/big"
 	"net/http"
 	"net/url"
 	"time"
 )
+
+var (
+	// ErrTooManyRequests is returned when the server responds 429.
+	ErrTooManyRequests = errors.New("too many requests")
+	// ErrEmptyToken is returned when the server responds success but token is empty.
+	ErrEmptyToken = errors.New("empty token from server")
+	// ErrInvalidChallenge is returned when the challenge string cannot be parsed as a base-10 big.Int.
+	ErrInvalidChallenge = errors.New("invalid challenge integer")
+)
+
+// HTTPStatusError is returned for non-200 responses (except 429 which maps to ErrTooManyRequests).
+type HTTPStatusError struct {
+	Code int
+	Body string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("http %d: %s", e.Code, e.Body)
+}
+
+// bodySnippet reads up to n bytes from r and returns it as string.
+// Intended only for error reporting paths.
+func bodySnippet(r io.Reader, n int64) string {
+	if n <= 0 {
+		n = 2048
+	}
+	b, _ := io.ReadAll(io.LimitReader(r, n))
+	return string(b)
+}
 
 type Challenge struct {
 	RequestID string `json:"request_id"`
@@ -68,24 +96,27 @@ type ChallengeParams struct {
 }
 
 func RetToken(getTokenParams *GetTokenParams) (string, error) {
-	client := &http.Client{
-		Timeout: getTokenParams.TimeoutSec,
-	}
-	if getTokenParams.SNI != "" {
-		client = &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					ServerName: getTokenParams.SNI,
-				},
-			},
-		}
-	}
+	// Build transport by cloning the default so we inherit sane defaults
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+
+	// Keep environment proxy unless user explicitly passes one
 	if getTokenParams.Proxy != nil {
-		if client.Transport == nil {
-			client.Transport = &http.Transport{}
-		}
-		client.Transport.(*http.Transport).Proxy = http.ProxyURL(getTokenParams.Proxy)
+		tr.Proxy = http.ProxyURL(getTokenParams.Proxy)
 	}
+
+	// Apply custom SNI if provided
+	if getTokenParams.SNI != "" {
+		if tr.TLSClientConfig == nil {
+			tr.TLSClientConfig = &tls.Config{}
+		}
+		tr.TLSClientConfig.ServerName = getTokenParams.SNI
+	}
+
+	client := &http.Client{
+		Timeout:   getTokenParams.TimeoutSec,
+		Transport: tr,
+	}
+
 	challengeParams := &ChallengeParams{
 		BaseUrl:     getTokenParams.BaseUrl,
 		RequestPath: getTokenParams.RequestPath,
@@ -99,7 +130,6 @@ func RetToken(getTokenParams *GetTokenParams) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	//fmt.Println(challengeResponse.Challenge.Challenge)
 
 	// Solve challenge and submit answer
 	token, err := submitAnswer(challengeParams, challengeResponse)
@@ -117,23 +147,21 @@ func requestChallenge(challengeParams *ChallengeParams) (*RequestResponse, error
 	}
 	req.Header.Add("User-Agent", challengeParams.UserAgent)
 	//req.Header.Add("Host", getTokenParams.Host)
-	req.Host = challengeParams.Host
+	if challengeParams.Host != "" {
+		req.Host = challengeParams.Host
+	}
 	resp, err := challengeParams.Client.Do(req)
 	if err != nil {
 		return nil, err
 	}
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			fmt.Println(err)
-		}
-	}(resp.Body)
+	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		if resp.StatusCode == http.StatusTooManyRequests {
-			log.Fatalln("请求次数超限，请稍后再试")
+			return nil, ErrTooManyRequests
 		}
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		snippet := bodySnippet(resp.Body, 2048)
+		return nil, &HTTPStatusError{Code: resp.StatusCode, Body: snippet}
 	}
 
 	var challengeResponse RequestResponse
@@ -149,8 +177,10 @@ func submitAnswer(challengeParams *ChallengeParams, challengeResponse *RequestRe
 	requestTime := challengeResponse.RequestTime
 	challenge := challengeResponse.Challenge.Challenge
 	requestId := challengeResponse.Challenge.RequestID
-	N := new(big.Int)
-	N.SetString(challenge, 10)
+	N, ok := new(big.Int).SetString(challenge, 10)
+	if !ok {
+		return "", fmt.Errorf("%w: %q", ErrInvalidChallenge, challenge)
+	}
 	factorsList := factors(N)
 	if len(factorsList) != 2 {
 		return "", errors.New("factors function did not return exactly two factors")
@@ -177,31 +207,32 @@ func submitAnswer(challengeParams *ChallengeParams, challengeResponse *RequestRe
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Add("User-Agent", challengeParams.UserAgent)
 	//req.Header.Add("Host", getTokenParams.Host)
-	req.Host = challengeParams.Host
+	if challengeParams.Host != "" {
+		req.Host = challengeParams.Host
+	}
 
 	resp, err := challengeParams.Client.Do(req)
 	if err != nil {
 		return "", err
 	}
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			fmt.Println(err)
-		}
-	}(resp.Body)
+	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		if resp.StatusCode == http.StatusTooManyRequests {
-			return "", errors.New("请求次数超限")
+			return "", ErrTooManyRequests
 		}
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return "", errors.New(string(bodyBytes))
+		snippet := bodySnippet(resp.Body, 2048)
+		return "", &HTTPStatusError{Code: resp.StatusCode, Body: snippet}
 	}
 
 	var submitResponse SubmitResponse
 	err = json.NewDecoder(resp.Body).Decode(&submitResponse)
 	if err != nil {
 		return "", err
+	}
+
+	if submitResponse.Token == "" {
+		return "", ErrEmptyToken
 	}
 
 	return submitResponse.Token, nil
