@@ -2,14 +2,17 @@ package powclient
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
 	"net/http"
 	"net/url"
+	"path"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -18,8 +21,13 @@ var (
 	ErrTooManyRequests = errors.New("too many requests")
 	// ErrEmptyToken is returned when the server responds success but token is empty.
 	ErrEmptyToken = errors.New("empty token from server")
-	// ErrInvalidChallenge is returned when the challenge string cannot be parsed as a base-10 big.Int.
+	// ErrInvalidChallenge is returned when the challenge is invalid or cannot be reduced to exactly two prime factors.
 	ErrInvalidChallenge = errors.New("invalid challenge integer")
+
+	errNilGetTokenParams = errors.New("nil GetTokenParams")
+	errInvalidBaseURL    = errors.New("invalid BaseUrl")
+
+	transportCache sync.Map
 )
 
 // HTTPStatusError is returned for non-200 responses (except 429 which maps to ErrTooManyRequests).
@@ -75,7 +83,7 @@ type GetTokenParams struct {
 
 func NewGetTokenParams() *GetTokenParams {
 	return &GetTokenParams{
-		TimeoutSec:  5 * time.Second, // 你的默认值
+		TimeoutSec:  5 * time.Second,
 		BaseUrl:     "http://127.0.0.1:55000",
 		RequestPath: "/request_challenge",
 		SubmitPath:  "/submit_answer",
@@ -96,25 +104,24 @@ type ChallengeParams struct {
 }
 
 func RetToken(getTokenParams *GetTokenParams) (string, error) {
-	// Build transport by cloning the default so we inherit sane defaults
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-
-	// Keep environment proxy unless user explicitly passes one
-	if getTokenParams.Proxy != nil {
-		tr.Proxy = http.ProxyURL(getTokenParams.Proxy)
+	if getTokenParams == nil {
+		return "", errNilGetTokenParams
 	}
 
-	// Apply custom SNI if provided
-	if getTokenParams.SNI != "" {
-		if tr.TLSClientConfig == nil {
-			tr.TLSClientConfig = &tls.Config{}
-		}
-		tr.TLSClientConfig.ServerName = getTokenParams.SNI
+	baseURL, err := parseBaseURL(getTokenParams.BaseUrl)
+	if err != nil {
+		return "", err
+	}
+
+	ctx := context.Background()
+	if getTokenParams.TimeoutSec > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, getTokenParams.TimeoutSec)
+		defer cancel()
 	}
 
 	client := &http.Client{
-		Timeout:   getTokenParams.TimeoutSec,
-		Transport: tr,
+		Transport: getTransport(getTokenParams),
 	}
 
 	challengeParams := &ChallengeParams{
@@ -125,14 +132,16 @@ func RetToken(getTokenParams *GetTokenParams) (string, error) {
 		Host:        getTokenParams.Host,
 		Client:      client,
 	}
-	// Get challenge
-	challengeResponse, err := requestChallenge(challengeParams)
+
+	requestURL := resolveURL(baseURL, getTokenParams.RequestPath)
+	submitURL := resolveURL(baseURL, getTokenParams.SubmitPath)
+
+	challengeResponse, err := requestChallenge(ctx, challengeParams, requestURL)
 	if err != nil {
 		return "", err
 	}
 
-	// Solve challenge and submit answer
-	token, err := submitAnswer(challengeParams, challengeResponse)
+	token, err := submitAnswer(ctx, challengeParams, submitURL, challengeResponse)
 	if err != nil {
 		return "", err
 	}
@@ -140,83 +149,91 @@ func RetToken(getTokenParams *GetTokenParams) (string, error) {
 	return token, nil
 }
 
-func requestChallenge(challengeParams *ChallengeParams) (rr *RequestResponse, err error) {
-	req, err := http.NewRequest("GET", challengeParams.BaseUrl+challengeParams.RequestPath, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Add("User-Agent", challengeParams.UserAgent)
-	//req.Header.Add("Host", getTokenParams.Host)
-	if challengeParams.Host != "" {
-		req.Host = challengeParams.Host
-	}
-	resp, err := challengeParams.Client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); err == nil && cerr != nil {
-			err = fmt.Errorf("close response body: %w", cerr)
-		}
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		if resp.StatusCode == http.StatusTooManyRequests {
-			return nil, ErrTooManyRequests
-		}
-		snippet := bodySnippet(resp.Body, 2048)
-		return nil, &HTTPStatusError{Code: resp.StatusCode, Body: snippet}
+func parseBaseURL(raw string) (*url.URL, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, errInvalidBaseURL
 	}
 
-	var challengeResponse RequestResponse
-	if err = json.NewDecoder(resp.Body).Decode(&challengeResponse); err != nil {
-		return nil, err
+	baseURL, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errInvalidBaseURL, err)
 	}
-	rr = &challengeResponse
-	return
+	if baseURL.Scheme == "" || baseURL.Host == "" {
+		return nil, fmt.Errorf("%w: %q", errInvalidBaseURL, raw)
+	}
+	return baseURL, nil
 }
 
-func submitAnswer(challengeParams *ChallengeParams, challengeResponse *RequestResponse) (token string, err error) {
-	requestTime := challengeResponse.RequestTime
-	challenge := challengeResponse.Challenge.Challenge
-	requestId := challengeResponse.Challenge.RequestID
-	N, ok := new(big.Int).SetString(challenge, 10)
-	if !ok {
-		return "", fmt.Errorf("%w: %q", ErrInvalidChallenge, challenge)
+func resolveURL(baseURL *url.URL, endpointPath string) string {
+	if endpointPath == "" {
+		return baseURL.String()
 	}
-	factorsList := factors(N)
-	if len(factorsList) != 2 {
-		return "", errors.New("factors function did not return exactly two factors")
+
+	resolved := *baseURL
+	resolved.Path = path.Join(strings.TrimSuffix(baseURL.Path, "/"), endpointPath)
+	return resolved.String()
+}
+
+func requestChallenge(ctx context.Context, challengeParams *ChallengeParams, requestURL string) (*RequestResponse, error) {
+	var challengeResponse RequestResponse
+	if err := doJSONRequest(ctx, challengeParams, http.MethodGet, requestURL, nil, "", &challengeResponse); err != nil {
+		return nil, err
 	}
-	p1 := factorsList[0]
-	p2 := factorsList[1]
-	if p1.Cmp(p2) > 0 { // if p1 > p2
-		p1, p2 = p2, p1 // swap p1 and p2
+	return &challengeResponse, nil
+}
+
+func submitAnswer(ctx context.Context, challengeParams *ChallengeParams, submitURL string, challengeResponse *RequestResponse) (string, error) {
+	factors, err := solveSemiprime(ctx, challengeResponse.Challenge.Challenge)
+	if err != nil {
+		return "", err
 	}
+
 	submitRequest := SubmitRequest{
-		Challenge:   Challenge{RequestID: requestId},
-		Answer:      []string{p1.String(), p2.String()},
-		RequestTime: requestTime,
+		Challenge:   Challenge{RequestID: challengeResponse.Challenge.RequestID},
+		Answer:      []string{factors[0].String(), factors[1].String()},
+		RequestTime: challengeResponse.RequestTime,
 	}
 	requestBody, err := json.Marshal(submitRequest)
 	if err != nil {
 		return "", err
 	}
 
-	req, err := http.NewRequest("POST", challengeParams.BaseUrl+challengeParams.SubmitPath, bytes.NewBuffer(requestBody))
-	if err != nil {
+	var submitResponse SubmitResponse
+	if err := doJSONRequest(ctx, challengeParams, http.MethodPost, submitURL, bytes.NewReader(requestBody), "application/json", &submitResponse); err != nil {
 		return "", err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Add("User-Agent", challengeParams.UserAgent)
-	//req.Header.Add("Host", getTokenParams.Host)
+	if submitResponse.Token == "" {
+		return "", ErrEmptyToken
+	}
+	return submitResponse.Token, nil
+}
+
+func doJSONRequest(
+	ctx context.Context,
+	challengeParams *ChallengeParams,
+	method string,
+	endpoint string,
+	body io.Reader,
+	contentType string,
+	out any,
+) (err error) {
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
+	if err != nil {
+		return err
+	}
+	if challengeParams.UserAgent != "" {
+		req.Header.Set("User-Agent", challengeParams.UserAgent)
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
 	if challengeParams.Host != "" {
 		req.Host = challengeParams.Host
 	}
 
 	resp, err := challengeParams.Client.Do(req)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); err == nil && cerr != nil {
@@ -226,19 +243,51 @@ func submitAnswer(challengeParams *ChallengeParams, challengeResponse *RequestRe
 
 	if resp.StatusCode != http.StatusOK {
 		if resp.StatusCode == http.StatusTooManyRequests {
-			return "", ErrTooManyRequests
+			return ErrTooManyRequests
 		}
-		snippet := bodySnippet(resp.Body, 2048)
-		return "", &HTTPStatusError{Code: resp.StatusCode, Body: snippet}
+		return &HTTPStatusError{Code: resp.StatusCode, Body: bodySnippet(resp.Body, 2048)}
 	}
 
-	var submitResponse SubmitResponse
-	if err = json.NewDecoder(resp.Body).Decode(&submitResponse); err != nil {
-		return "", err
+	if out == nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil
 	}
-	if submitResponse.Token == "" {
-		return "", ErrEmptyToken
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return err
 	}
-	token = submitResponse.Token
-	return
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+func getTransport(getTokenParams *GetTokenParams) *http.Transport {
+	key := transportCacheKey(getTokenParams)
+	if cached, ok := transportCache.Load(key); ok {
+		return cached.(*http.Transport)
+	}
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 128
+	transport.MaxIdleConnsPerHost = 32
+	if getTokenParams.Proxy != nil {
+		transport.Proxy = http.ProxyURL(getTokenParams.Proxy)
+	}
+	if getTokenParams.SNI != "" {
+		tlsConfig := &tls.Config{}
+		if transport.TLSClientConfig != nil {
+			tlsConfig = transport.TLSClientConfig.Clone()
+		}
+		tlsConfig.ServerName = getTokenParams.SNI
+		transport.TLSClientConfig = tlsConfig
+	}
+
+	actual, _ := transportCache.LoadOrStore(key, transport)
+	return actual.(*http.Transport)
+}
+
+func transportCacheKey(getTokenParams *GetTokenParams) string {
+	proxyURL := ""
+	if getTokenParams.Proxy != nil {
+		proxyURL = getTokenParams.Proxy.String()
+	}
+	return proxyURL + "\x00" + getTokenParams.SNI
 }

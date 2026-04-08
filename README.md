@@ -20,7 +20,7 @@ func RetToken(p *GetTokenParams) (string, error)
 
 // 参数：
 type GetTokenParams struct {
-    TimeoutSec  time.Duration // 整体请求超时
+    TimeoutSec  time.Duration // 当 > 0 时覆盖整个取 token 流程：获取 challenge、本地求解、提交 answer
     BaseUrl     string        // 例如 "https://example.com"
     RequestPath string        // 例如 "/request_challenge"
     SubmitPath  string        // 例如 "/submit_answer"
@@ -38,7 +38,7 @@ func NewGetTokenParams() *GetTokenParams // 提供一份可用的默认值
 var (
     ErrTooManyRequests  = errors.New("too many requests")      // 429
     ErrEmptyToken       = errors.New("empty token from server") // 200 但 token 为空
-    ErrInvalidChallenge = errors.New("invalid challenge integer")
+    ErrInvalidChallenge = errors.New("invalid challenge integer") // challenge 非法、不可分解或不满足“恰好两个质因子”
 )
 
 type HTTPStatusError struct {
@@ -49,7 +49,7 @@ type HTTPStatusError struct {
 - 发生 429：返回 ErrTooManyRequests（可做重试/退避）
 - 发生其它非 200：返回 *HTTPStatusError（可通过 errors.As 拿到 Code/Body）
 - 发生 200 但 token 为空：返回 ErrEmptyToken
-- 挑战串解析失败：返回 ErrInvalidChallenge（包含原始字符串）
+- challenge 非法、不可分解、不是恰好两个质因子：返回 ErrInvalidChallenge（包含上下文）
 
 ## DEMO
 ```go
@@ -61,7 +61,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/nxtrace/powclient"
+	"github.com/tsosunchia/powclient"
 )
 
 func main() {

@@ -1,51 +1,104 @@
 package powclient
 
 import (
-	"fmt"
+	"context"
+	"errors"
 	"math/big"
-	"strings"
 	"testing"
 	"time"
 )
 
-func TestFactors(t *testing.T) {
-	p1 := big.NewInt(24801309629)
-	p2 := big.NewInt(34244502967)
-	input := (new(big.Int).Mul(p1, p2)).String()
-	input = strings.TrimSuffix(input, "\n")
+func TestSolveSemiprime(t *testing.T) {
+	largeP1 := big.NewInt(24801309629)
+	largeP2 := big.NewInt(34244502967)
+	largeSemiprime := new(big.Int).Mul(largeP1, largeP2).String()
 
-	N := new(big.Int)
-	N.SetString(input, 10)
-	// Start timer
-	start := time.Now()
-	// Calculation
-	factorsList := factors(N)
-	// End timer
-	elapsed := time.Since(start)
-	// Output results
-	for _, factor := range factorsList {
-		fmt.Println(factor)
+	testCases := []struct {
+		name      string
+		challenge string
+		want      []string
+		wantErr   error
+	}{
+		{
+			name:      "distinct primes",
+			challenge: "35",
+			want:      []string{"5", "7"},
+		},
+		{
+			name:      "repeated prime",
+			challenge: "25",
+			want:      []string{"5", "5"},
+		},
+		{
+			name:      "large semiprime",
+			challenge: largeSemiprime,
+			want:      []string{largeP1.String(), largeP2.String()},
+		},
+		{
+			name:      "one is invalid",
+			challenge: "1",
+			wantErr:   ErrInvalidChallenge,
+		},
+		{
+			name:      "zero is invalid",
+			challenge: "0",
+			wantErr:   ErrInvalidChallenge,
+		},
+		{
+			name:      "negative is invalid",
+			challenge: "-35",
+			wantErr:   ErrInvalidChallenge,
+		},
+		{
+			name:      "prime is invalid",
+			challenge: "13",
+			wantErr:   ErrInvalidChallenge,
+		},
+		{
+			name:      "more than two prime factors is invalid",
+			challenge: "30",
+			wantErr:   ErrInvalidChallenge,
+		},
 	}
-	fmt.Printf("Elapsed time: %s\n", elapsed)
 
-	expected := []*big.Int{
-		p1,
-		p2,
-	}
-
-	if !equalSlices(factorsList, expected) {
-		t.Errorf("factorsList does not match expected values")
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			factors, err := solveSemiprime(context.Background(), tc.challenge)
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("solveSemiprime(%q) error = %v, want %v", tc.challenge, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("solveSemiprime(%q) error = %v", tc.challenge, err)
+			}
+			if len(factors) != len(tc.want) {
+				t.Fatalf("solveSemiprime(%q) len = %d, want %d", tc.challenge, len(factors), len(tc.want))
+			}
+			for i, want := range tc.want {
+				if factors[i].String() != want {
+					t.Fatalf("solveSemiprime(%q)[%d] = %s, want %s", tc.challenge, i, factors[i].String(), want)
+				}
+			}
+		})
 	}
 }
 
-func equalSlices(slice1, slice2 []*big.Int) bool {
-	if len(slice1) != len(slice2) {
-		return false
+func TestSolveSemiprimeHonorsContextDeadline(t *testing.T) {
+	originalHook := pollardRhoStepHook
+	pollardRhoStepHook = func() {
+		time.Sleep(2 * time.Millisecond)
 	}
-	for i := range slice1 {
-		if slice1[i].Cmp(slice2[i]) != 0 {
-			return false
-		}
+	defer func() {
+		pollardRhoStepHook = originalHook
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+
+	_, err := solveSemiprime(ctx, "849387260465695603243")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("solveSemiprime deadline error = %v, want %v", err, context.DeadlineExceeded)
 	}
-	return true
 }
