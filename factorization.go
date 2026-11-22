@@ -119,7 +119,7 @@ func pollardRhoFactor(ctx context.Context, n *big.Int) (*big.Int, error) {
 	diff := new(big.Int)
 	divisor := new(big.Int)
 
-	for attempt := 0; attempt < 24; attempt++ {
+	for range 24 {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -135,7 +135,7 @@ func pollardRhoFactor(ctx context.Context, n *big.Int) (*big.Int, error) {
 		}
 		divisor.Set(bigOne)
 
-		for iter := 0; iter < 1<<16; iter++ {
+		for range 1 << 16 {
 			if pollardRhoStepHook != nil {
 				pollardRhoStepHook()
 			}

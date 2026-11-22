@@ -52,7 +52,7 @@ func BenchmarkSolveSemiprime(b *testing.B) {
 				return
 			}
 
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				if err := call(); err != nil {
 					b.Fatal(err)
 				}
@@ -97,11 +97,11 @@ func BenchmarkRetToken(b *testing.B) {
 				})
 			}
 
-			var serialCounter uint64
+			var serialCounter atomic.Uint64
 			call := func() error {
 				params := newBenchmarkGetTokenParams(server.URL, bm.timeout)
 				if bm.isolated {
-					params.SNI = fmt.Sprintf("bench-%d", atomic.AddUint64(&serialCounter, 1))
+					params.SNI = fmt.Sprintf("bench-%d", serialCounter.Add(1))
 				}
 
 				_, err := RetToken(params)
@@ -131,7 +131,7 @@ func BenchmarkRetToken(b *testing.B) {
 				b.SetParallelism(4)
 				runParallelBenchmark(b, 2, call)
 			} else {
-				for i := 0; i < b.N; i++ {
+				for b.Loop() {
 					if err := call(); err != nil {
 						b.Fatal(err)
 					}

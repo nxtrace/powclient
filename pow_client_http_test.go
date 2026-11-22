@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -140,8 +141,8 @@ func TestRetTokenHTTPStatusErrorIncludesSnippet(t *testing.T) {
 	params.BaseUrl = server.URL
 
 	_, err := RetToken(params)
-	var httpErr *HTTPStatusError
-	if !errors.As(err, &httpErr) {
+	httpErr, ok := errors.AsType[*HTTPStatusError](err)
+	if !ok {
 		t.Fatalf("RetToken() error = %v, want *HTTPStatusError", err)
 	}
 	if httpErr.Code != http.StatusInternalServerError {
@@ -216,35 +217,54 @@ func TestRetTokenInvalidJSON(t *testing.T) {
 }
 
 func TestRetTokenTimeoutDuringSolve(t *testing.T) {
-	originalHook := pollardRhoStepHook
-	pollardRhoStepHook = func() {
-		time.Sleep(2 * time.Millisecond)
-	}
-	defer func() {
-		pollardRhoStepHook = originalHook
-	}()
+	synctest.Test(t, func(t *testing.T) {
+		const timeout = time.Millisecond
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/request_challenge":
-			_ = json.NewEncoder(w).Encode(RequestResponse{
-				Challenge:   Challenge{RequestID: "req-1", Challenge: "849387260465695603243"},
-				RequestTime: 123,
-			})
-		default:
-			http.NotFound(w, r)
+		server := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/request_challenge":
+				_ = json.NewEncoder(w).Encode(RequestResponse{
+					Challenge:   Challenge{RequestID: "req-1", Challenge: "849387260465695603243"},
+					RequestTime: 123,
+				})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		client := server.Client()
+		transport, ok := client.Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("test server transport = %T, want *http.Transport", client.Transport)
 		}
-	}))
-	defer server.Close()
 
-	params := NewGetTokenParams()
-	params.BaseUrl = server.URL
-	params.TimeoutSec = time.Millisecond
+		params := NewGetTokenParams()
+		params.BaseUrl = server.URL
+		params.TimeoutSec = timeout
+		params.SNI = "solve-timeout.test"
+		key := transportCacheKey(params)
+		transportCache.Store(key, transport)
+		t.Cleanup(func() {
+			transportCache.Delete(key)
+		})
 
-	_, err := RetToken(params)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("RetToken() timeout error = %v, want %v", err, context.DeadlineExceeded)
-	}
+		enteredSolve := false
+		originalHook := pollardRhoStepHook
+		pollardRhoStepHook = func() {
+			enteredSolve = true
+			synctest.Sleep(timeout)
+		}
+		defer func() {
+			pollardRhoStepHook = originalHook
+		}()
+
+		_, err := RetToken(params)
+		if !enteredSolve {
+			t.Fatalf("solver step hook was not called, RetToken() error = %v", err)
+		}
+		if err != context.DeadlineExceeded {
+			t.Fatalf("RetToken() timeout error = %v, want %v", err, context.DeadlineExceeded)
+		}
+	})
 }
 
 func TestTransportReuseAndIsolation(t *testing.T) {
@@ -326,7 +346,7 @@ func TestRetTokenReusesHTTPConnection(t *testing.T) {
 	params := NewGetTokenParams()
 	params.BaseUrl = server.URL
 
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		token, err := RetToken(params)
 		if err != nil {
 			t.Fatalf("RetToken() call %d error = %v", i, err)
