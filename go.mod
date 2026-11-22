@@ -1,3 +1,3 @@
 module github.com/tsosunchia/powclient
 
-go 1.25
+go 1.27.4
