@@ -118,7 +118,7 @@ func pollardRhoFactor(ctx context.Context, n *big.Int) (*big.Int, error) {
 	maxC := new(big.Int).Sub(n, bigOne)
 	diff := new(big.Int)
 	divisor := new(big.Int)
-	var quotient big.Int
+	var quotient, product big.Int
 
 	for range 24 {
 		if err := ctx.Err(); err != nil {
@@ -144,9 +144,9 @@ func pollardRhoFactor(ctx context.Context, n *big.Int) (*big.Int, error) {
 				return nil, err
 			}
 
-			rhoStep(x, c, n, &quotient)
-			rhoStep(y, c, n, &quotient)
-			rhoStep(y, c, n, &quotient)
+			rhoStep(x, c, n, &quotient, &product)
+			rhoStep(y, c, n, &quotient, &product)
+			rhoStep(y, c, n, &quotient, &product)
 
 			diff.Sub(x, y)
 			diff.Abs(diff)
@@ -167,10 +167,10 @@ func pollardRhoFactor(ctx context.Context, n *big.Int) (*big.Int, error) {
 	return nil, fmt.Errorf("%w: factorization failed", ErrInvalidChallenge)
 }
 
-func rhoStep(x, c, n, quotient *big.Int) {
-	x.Mul(x, x)
-	x.Add(x, c)
-	quotient.DivMod(x, n, x)
+func rhoStep(x, c, n, quotient, product *big.Int) {
+	product.Mul(x, x)
+	product.Add(product, c)
+	quotient.DivMod(product, n, x)
 }
 
 func randomBetween(minInclusive, maxInclusive *big.Int) (*big.Int, error) {
